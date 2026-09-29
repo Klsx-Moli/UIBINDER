@@ -1,0 +1,116 @@
+"""UI AST endpoints: analyze screenshot, get/save document, DESIGN.md."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import APIRouter, HTTPException
+from PIL import Image
+from pydantic import BaseModel
+
+from backend.api.common import get_store
+from backend.logging_setup import log
+from backend.persistence.store import CorruptDocumentError
+from backend.schema.ui_schema import UIDocument
+from backend.vision import get_provider
+from backend.vision.tokens_extract import extract_tokens, tokens_to_design_md
+
+router = APIRouter(tags=["ui"])
+
+
+def _corrupt_422(exc: CorruptDocumentError) -> HTTPException:
+    return HTTPException(422, {
+        "message": "El documento UI persistido está corrupto.",
+        "where": "ui_documents",
+        "cause": str(exc),
+        "action": "Restaura un snapshot (POST /api/workspaces/{id}/snapshots/{snap}/restore), "
+                  "vuelve a ejecutar Analyze UI, o guarda un documento válido (PUT /ui) para "
+                  "reemplazarlo.",
+    })
+
+
+class AnalyzeRequest(BaseModel):
+    image_id: Optional[str] = None
+    provider: str = "heuristic"
+
+
+@router.post("/workspaces/{ws_id}/analyze-ui")
+def analyze_ui(ws_id: str, body: AnalyzeRequest) -> dict[str, Any]:
+    store = get_store()
+    if not store.workspace_exists(ws_id):
+        raise HTTPException(404, f"Workspace '{ws_id}' no existe.")
+    image = store.get_image(body.image_id) if body.image_id else store.get_reference_image(ws_id)
+    if image is None:
+        raise HTTPException(409, "No hay imagen de referencia: importa primero un screenshot.")
+    path = Path(image["path"])
+    if not path.is_file():
+        raise HTTPException(410, "El archivo de la imagen de referencia no está en disco; vuelve a importarlo.")
+
+    try:
+        provider = get_provider(body.provider)
+        with Image.open(path) as img:
+            img.load()
+            document, notes = provider.analyze(img)
+            tokens = extract_tokens(img, document)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:  # vision crashed on a broken image
+        log(ws_id, "ERROR", "vision analysis failed", error=str(exc), provider=body.provider)
+        raise HTTPException(422, f"El análisis visual falló: {exc}") from exc
+
+    design_md = tokens_to_design_md(tokens, document.metadata)
+    wrapper = {"ui": document.model_dump(), "tokens": tokens.model_dump(), "design_md": design_md}
+    store.save_ui_document(ws_id, wrapper)
+    log(ws_id, "INFO", "analyze-ui completed", provider=body.provider,
+        components=notes.get("components"), counts=notes.get("counts"))
+    return {"notes": notes, "tokens": tokens.model_dump(),
+            "components": len(document.components), "version": store.get_ui_document(ws_id)["version"]}
+
+
+@router.get("/workspaces/{ws_id}/ui")
+def get_ui(ws_id: str) -> dict[str, Any]:
+    store = get_store()
+    try:
+        row = store.get_ui_document(ws_id)
+    except CorruptDocumentError as exc:
+        raise _corrupt_422(exc) from exc
+    if row is None:
+        raise HTTPException(409, "Aún no hay documento UI: ejecuta antes ANALYZE UI.")
+    return row["json"]
+
+
+class UIDocumentPut(BaseModel):
+    document: UIDocument
+
+
+@router.put("/workspaces/{ws_id}/ui")
+def put_ui(ws_id: str, body: UIDocumentPut) -> dict[str, Any]:
+    store = get_store()
+    if not store.workspace_exists(ws_id):
+        raise HTTPException(404, f"Workspace '{ws_id}' no existe.")
+    problems = body.document.validate_structure()
+    if problems:
+        raise HTTPException(422, {"message": "El documento UI no supera la validación estructural.",
+                                  "problems": problems[:20]})
+    try:
+        previous = store.get_ui_document(ws_id)
+    except CorruptDocumentError:
+        previous = None  # a fresh valid PUT heals a corrupt document
+    wrapper = {"ui": body.document.model_dump()}
+    if previous and isinstance(previous["json"], dict):
+        wrapper["tokens"] = previous["json"].get("tokens")
+        wrapper["design_md"] = previous["json"].get("design_md")
+    store.save_ui_document(ws_id, wrapper)
+    return {"saved": True, "components": len(body.document.components),
+            "version": store.get_ui_document(ws_id)["version"]}
+
+
+@router.get("/workspaces/{ws_id}/design.md")
+def design_md(ws_id: str) -> dict[str, str]:
+    try:
+        row = get_store().get_ui_document(ws_id)
+    except CorruptDocumentError as exc:
+        raise _corrupt_422(exc) from exc
+    if row is None or not row["json"].get("design_md"):
+        raise HTTPException(409, "Aún no hay tokens de diseño: ejecuta antes ANALYZE UI.")
+    return {"markdown": row["json"]["design_md"]}
